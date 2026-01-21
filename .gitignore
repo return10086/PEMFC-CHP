@@ -1,0 +1,45 @@
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Python build / cache ---
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# --- Virtual envs ---
+.venv/
+venv/
+ENV/
+env/
+
+# --- Logs / TensorBoard ---
+logs/
+**/logs/
+**/events.out.tfevents.*
+
+# --- Large binary artifacts (models/checkpoints/results) ---
+*.npy
+*.npz
+*.pkl
+*.pt
+*.pth
+*.onnx
+*.zip
+*.tar
+*.tar.gz
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Others you likely don't want in git ---
+*.swp
+*.swo
