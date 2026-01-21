@@ -20,6 +20,9 @@ build/
 venv/
 ENV/
 
+# Allow tracking project code folder named "env"
+!env/
+
 # --- Logs / TensorBoard ---
 logs/
 **/logs/
