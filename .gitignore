@@ -19,7 +19,6 @@ build/
 .venv/
 venv/
 ENV/
-env/
 
 # --- Logs / TensorBoard ---
 logs/
