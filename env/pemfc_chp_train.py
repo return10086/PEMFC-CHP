@@ -2,8 +2,8 @@
 Author: Jiale Cheng &&cjl2646289864@gmail.com
 Date: 2025-12-11 22:09:38
 LastEditors: Jiale Cheng &&cjl2646289864@gmail.com
-LastEditTime: 2026-01-21 22:51:53
-FilePath: \PC\env_2\pemfc_chp_train.py
+LastEditTime: 2026-01-23 17:14:38
+FilePath: \PC\env\pemfc_chp_train.py
 Description: 单纯作为 PEMFC-CHP 强化学习环境的定义与训练脚本
 Copyright (c) 2026 by cjl2646289864@gmail.com, All Rights Reserved. 
 '''
@@ -53,7 +53,7 @@ class PEMFCCHPEnv(gym.Env):
             # -------- 电池 --------
             'C_batt_Ah': 100.0,
             'V_batt': 48.0,
-            'eta_batt': 0.95,
+            'eta_batt': 0.95,# 这是充放电效率的乘积
             'SOC_init': 0.5,
 
             # -------- 初始 --------
@@ -71,18 +71,11 @@ class PEMFCCHPEnv(gym.Env):
 
             # -------- Reward --------
             'wP': 5.0,              # ↓ 原 10 → 稍微降，避免电功率独裁
-            'wT': 20.0,             # ↓ 原 16 → 与 wP 接近但略高（CHP 特性）
-            'wfuel': 620.0,          # ↓ 原 20 → 防止策略过度压低功率
-            'wSOH': 120.0,            # ↓ 原 5 → SOH 是“软约束”，不是主目标
-            'wsoc': 20.0,            # ↑ 新增 → 明确鼓励保持 SOC 在目标区间
             
             'SOC_target': 0.5,
             'SOC_band': 0.05,       # ↑ 原 0.1 → 给 RL 更宽容区间
             'T_tank_target': 273.15+60,#暂时定为80℃
             'T_band': 2.5,         # ↑ 原 10 → 减少热侧震荡
-
-            'k_soc': 0.8,           # ↓ 原 1.0 → SOC 只作“方向引导”
-            'k_temp': 0.8,
 
             # -------- 论文中的 SOH 关键参数 --------
             'kappa_1': 13.79e-6,  # 启停单次电压降 (V)
@@ -189,69 +182,6 @@ class PEMFCCHPEnv(gym.Env):
         return j_vec, raw_alpha
 
     '''
-    description: 更新SOH
-    param {*} self:
-    param {*} j_vec:电流密度
-    return {*}
-    '''    
-    def _update_SOH(self, j_vec):
-        p = self.p
-        SOH_prev = self.state_SOH.copy()
-
-        # -----------------------
-        # 1. 归一化应力
-        # -----------------------
-        stress_J = j_vec / p['J_max']
-        stress_dyn = np.abs(j_vec - self.state_j_prev) / p['J_max']
-
-        stress = (
-            p['w_deg_J'] * stress_J +
-            p['w_deg_dyn'] * stress_dyn
-        )
-        # -----------------------
-        # 2. 安全区以下不退化
-        # -----------------------
-        # stress_eff = np.maximum(stress - p['stress_safe'], 0.0)
-    
-        # -----------------------
-        # 3. 退化项（step-based）
-        # -----------------------
-        dSOH_deg = p['k_deg'] * stress**2   # 非线性更稳定
-
-        # -----------------------
-        # 4. 低应力计数器更新
-        # -----------------------
-        low_mask = stress < p['stress_recover_th']
-
-        self.low_stress_counter = np.where(
-            low_mask,
-            self.low_stress_counter + 1,
-            0
-        )
-
-        # -----------------------
-        # 5. 恢复强度（延迟 + 平滑）
-        # -----------------------
-        # recover_strength = np.clip(
-        #     (self.low_stress_counter - p['recover_steps_min']) / p['recover_ramp'],
-        #     0.0,
-        #     1.0
-        # )
-
-        # dSOH_rec = (
-        #     p['k_rec']
-        #     * recover_strength
-        #     * (1.0 - self.state_SOH)
-        # )
-        
-        # -----------------------
-        # 6. SOH 更新（不再乘 dt）
-        # -----------------------
-        self.state_SOH += (-dSOH_deg)
-        # self.state_SOH = np.clip(self.state_SOH, p['SOH_min'], 1.0)
-
-        return np.mean(self.state_SOH - SOH_prev)
-    '''
     description: 基于论文1的SOH退化模型
     return {
         delta_SOH_fc: 本步燃料电池 SOH 变化量
@@ -326,36 +256,44 @@ class PEMFCCHPEnv(gym.Env):
         SOC_new:更新后的SOC
     }
     '''    
-    def _update_SOC(self, SOC_old, P_charge, P_heater):
+    def _update_SOC(self, SOC_old, P_batt_charge_from_fc, P_batt_discharge_output):
         """
-        SOC 更新（唯一入口）
+        SOC 更新（唯一入口，基于能量守恒）
 
         参数说明：
-        - SOC_old   : step 开始时的 SOC
-        - P_charge  : PEMFC → 电池的充电功率 (W)
-        - P_heater  : 电池 → 电加热棒的放电功率 (W)
-                    ⚠️ 注意：这里只包含“来自电池的那一部分”
+        - SOC_old: step 开始时的 SOC (0..1)
+        - P_batt_charge_from_fc: 燃料电池向电池的充电功率（W，正）
+        - P_batt_discharge_output: 电池对外输出的放电功率（W，正，包含给加热棒和负载的输出功率）
+
+        能量守恒：
+            E_new = E_old + eta_ch * P_charge * dt - (P_dis_out / eta_dis) * dt
+        然后 SOC = E_new / E_capacity
         """
 
         p = self.p
 
-        # ============================================================
-        # 1. SOC → 功率换算
-        # ============================================================
-        soc_to_w = (
-            p['C_batt_Ah'] * p['V_batt']
-            / (p['dt'] / 3600.0)
-            * p['eta_batt']
-        )
+        # 电池容量 (Wh)
+        capacity_Wh = p['C_batt_Ah'] * p['V_batt']
+        dt_hr = p['dt'] / 3600.0
 
-        # ============================================================
-        # 2. 充电 + 放电
-        # ============================================================
-        dSOC_charge = P_charge / soc_to_w
-        dSOC_discharge = - P_heater / soc_to_w
+        # 将总充/放效率分拆为充放两端（p['eta_batt'] 原来为乘积）
+        eta_total = p.get('eta_batt', 1.0)
+        # 均分到充电/放电端（简单且常用的做法）
+        eta_ch = math.sqrt(max(eta_total, 0.0))
+        eta_dis = eta_ch
 
-        SOC_new = SOC_old + dSOC_charge + dSOC_discharge
+        # 旧能量 (Wh)
+        E_old_Wh = SOC_old * capacity_Wh
 
+        # 充电端实际写入电池的能量 (Wh)
+        E_ch_Wh = eta_ch * max(P_batt_charge_from_fc, 0.0) * dt_hr
+
+        # 放电端从电池内部抽取的能量 (Wh)（注意 P_batt_discharge_output 是对外输出）
+        E_dis_internal_Wh = (max(P_batt_discharge_output, 0.0) / max(eta_dis, 1e-8)) * dt_hr
+
+        E_new_Wh = E_old_Wh + E_ch_Wh - E_dis_internal_Wh
+
+        SOC_new = E_new_Wh / max(capacity_Wh, 1e-9)
         return np.clip(SOC_new, 0.0, 1.0)
 
 
@@ -387,7 +325,9 @@ class PEMFCCHPEnv(gym.Env):
             * (self.state_T_tank - p['T_tank_target']-p ['T_band'])
         ) / p['dt']
 
-        Q_loss = (self.state_T_tank - p['T_amb']) / p['R_air_thermal'] * p['dt']
+        # 热损失应为瞬时热功率（W）：(T_tank - T_amb)/R (K / (K/W) = W)
+        # 之前乘以 dt 会把单位变成能量 (J)，与其它量（W）混用会导致单位错误。
+        Q_loss = (self.state_T_tank - p['T_amb']) / p['R_air_thermal']
 
         # 正值表示缺热
         Q_deficit = Q_need - (  Q_tank_avail) + Q_loss
@@ -403,10 +343,12 @@ class PEMFCCHPEnv(gym.Env):
         # ============================================================
         # 3. SOC → 功率换算
         # ============================================================
+        # 将 1.0 SOC 对应到在一个时间步长内的可转换功率 (W)
+        # capacity_Wh = C_batt_Ah * V_batt
+        # soc_to_w = capacity_Wh / (dt/3600) = capacity_Wh * 3600 / dt
         soc_to_w = (
             p['C_batt_Ah'] * p['V_batt']
             / (p['dt'] / 3600.0)
-            * p['eta_batt']
         )
 
         SOC_target = p['SOC_target']
@@ -520,6 +462,7 @@ class PEMFCCHPEnv(gym.Env):
     return {*}
     '''    
     def step(self, action):
+        p=self.p
         # ============================================================
         # 0. 解析动作
         # ============================================================
@@ -561,21 +504,33 @@ class PEMFCCHPEnv(gym.Env):
         P_gen = P_gen_raw - P_heater_fc - P_charge
 
         # ============================================================
-        # 5. SOC给电需求做补充
+        # 5. 电池给负载/加热棒补电（区分输出与能量上限）
         # ============================================================
-        SOC_to_fc =0
-        if P_gen < P_need:#如果缺电
-            P_deficit = P_need - P_gen#缺这么多
-            soc_to_w = (
-                self.p['C_batt_Ah'] * self.p['V_batt']
-                / (self.p['dt'] / 3600.0)
-                * self.p['eta_batt']
-            )
-            SOC_to_fc = min(#有多少电全补
-                self.state_SOC * soc_to_w,
-                P_deficit
-            )
-            P_gen += SOC_to_fc
+        SOC_to_fc_output = 0.0
+        if P_gen < P_need:  # 如果缺电
+            P_deficit = P_need - P_gen  # 缺这么多
+
+            # 计算电池可用的最小 SOC 下限（与 _thermal_management 保持一致）
+            SOC_target = p['SOC_target']
+            SOC_band = p['SOC_band']
+            SOC_lower = SOC_target - SOC_band
+            SOC_emergency = max(SOC_lower - 0.05, 0.0)
+            SOC_min = SOC_emergency
+
+            # 电池容量和放电效率
+            capacity_Wh = p['C_batt_Ah'] * p['V_batt']
+            eta_total = p.get('eta_batt', 1.0)
+            eta_dis = math.sqrt(max(eta_total, 0.0))
+
+            # 可用能量 (Wh)
+            available_energy_Wh = max(self.state_SOC - SOC_min, 0.0) * capacity_Wh
+
+            # 在当前时间步内，电池能够对外提供的最大输出功率（W，已考虑放电效率）
+            max_output_power_W = available_energy_Wh * eta_dis * 3600.0 / p['dt']
+
+            # 实际从电池对外输出给负载的功率（W）
+            SOC_to_fc_output = min(max_output_power_W, P_deficit)
+            P_gen += SOC_to_fc_output
         
         # ============================================================
         # 6. 更新水箱温度（只在这里更新）
@@ -589,10 +544,11 @@ class PEMFCCHPEnv(gym.Env):
         # ============================================================
         # 7. 更新 SOC（只在这里更新）
         # ============================================================
+        # 将 P_charge（来自 PEMFC 的充电功率）和电池对外放电合并传入 SOC 更新
         next_SOC = self._update_SOC(
             SOC_old=SOC_old,
-            P_charge=P_charge-SOC_to_fc,#给SOC充的电-电池给PEMFC补的电
-            P_heater=P_heater_batt
+            P_batt_charge_from_fc=P_charge,
+            P_batt_discharge_output=(P_heater_batt + SOC_to_fc_output)
         )
 
         # ============================================================
@@ -632,15 +588,34 @@ class PEMFCCHPEnv(gym.Env):
             'T_tank_C': next_T - 273.15,
             'SOH': self.state_fc_SOH,
 
-            'P_gen_W': P_gen / 1000,
-            'P_need_W': P_need / 1000,
-            'P_raw_W': P_gen_raw / 1000,
+            # 同时提供 W 与 KW 单位的键，便于外部使用者选择
+            'P_gen_W': P_gen,
+            'P_gen_KW': P_gen / 1000.0,
+            'P_gen_KWh': (P_gen / 1000.0) * (p['dt'] / 3600.0),
+            'P_need_W': P_need,
+            'P_need_KW': P_need / 1000.0,
+            'P_need_KWh': (P_need / 1000.0) * (p['dt'] / 3600.0),
+            'P_raw_W': P_gen_raw,
+            'P_raw_KW': P_gen_raw / 1000.0,
+            'P_raw_KWh': (P_gen_raw / 1000.0) * (p['dt'] / 3600.0),
+            
+            'H2_rate_mol_s': mol_H2,
 
-            'Q_gen_kW': Q_gen / 1000,
-            'Q_need_kW': Q_need / 1000,
-            'Q_heater': Q_heater / 1000,
-            'Q_loss': Q_loss / 1000,
-            'Q_gen_used': Q_gen_used / 1000,
+            'Q_gen_W': Q_gen,
+            'Q_gen_KW': Q_gen / 1000.0,
+            'Q_gen_KWh': (Q_gen / 1000.0) * (p['dt'] / 3600.0),
+            'Q_need_W': Q_need,
+            'Q_need_KW': Q_need / 1000.0,
+            'Q_need_KWh': (Q_need / 1000.0) * (p['dt'] / 3600.0),
+            'Q_heater_W': Q_heater,
+            'Q_heater_KW': Q_heater / 1000.0,
+            'Q_heater_KWh': (Q_heater / 1000.0) * (p['dt'] / 3600.0),
+            'Q_loss_W': Q_loss,
+            'Q_loss_KW': Q_loss / 1000.0,
+            'Q_loss_KWh': (Q_loss / 1000.0) * (p['dt'] / 3600.0),
+            'Q_gen_used_W': Q_gen_used,
+            'Q_gen_used_KW': Q_gen_used / 1000.0,
+            'Q_gen_used_KWh': (Q_gen_used / 1000.0) * (p['dt'] / 3600.0),
             'reward': reward,
         }
 
@@ -700,14 +675,12 @@ class DetailedLogCallback(BaseCallback):
             self.logger.record("time/wall", ts_str)
 
             log_keys = [
-                'P_need_W',
-                'P_gen_W',
-                'Q_gen_kW',
-                'Q_need_kW',
+                'P_need_KW',
+                'P_gen_KW',
+                'Q_gen_KW',
+                'Q_need_KW',
                 'T_tank_C',
                 'SOC',
-                #'SOH',
-                #'alpha'
             ]
 
             # ==========================

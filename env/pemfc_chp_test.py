@@ -2,12 +2,11 @@
 Author: Jiale Cheng &&cjl2646289864@gmail.com
 Date: 2025-12-11 22:09:38
 LastEditors: Jiale Cheng &&cjl2646289864@gmail.com
-LastEditTime: 2026-01-21 07:35:07
-FilePath: \PC\env_2\pemfc_chp_test.py
+LastEditTime: 2026-01-23 18:12:53
+FilePath: \PC\env\pemfc_chp_test.py
 Description: 单纯作为测试脚本使用，加载训练好的模型进行推理，并绘图分析结果
 Copyright (c) 2026 by cjl2646289864@gmail.com, All Rights Reserved. 
 '''
-
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 import numpy as np
@@ -54,40 +53,42 @@ def run_test():
 def plot_analysis():
     # 读取结果
     history = np.load("test_results.npy", allow_pickle=True)
-    # 数据提取
-    P_gen_final = np.array([x['P_gen_W'] for x in history])     # kW生成的电功率与SOC和热水箱交互后剩下的电功率
-    P_load = np.array([x['P_need_W'] for x in history])         # kW 电负载需求
-    P_raw_W = np.array([x['P_raw_W'] for x in history])     # kW PEMFC 原始发电功率
-    
-    Q_gen = np.array([x['Q_gen_kW'] for x in history])          # kW PEMFC 实际产热
-    Q_heater = np.array([x['Q_heater'] for x in history])       # kW 加热棒产热
-    Q_load = np.array([x['Q_need_kW'] for x in history])        # kW 热负载需求
-    Q_loss = np.array([x['Q_loss'] for x in history])           # kW 热损失
-    Q_gen_used = np.array([x['Q_gen_used'] for x in history])   # kW 实际被用掉的 PEMFC 产热
-    
-    
+
+    # 数据提取（使用环境提供的 _KW kW 字段）
+    P_gen_final_KWh = np.array([x['P_gen_KWh'] for x in history])     # kW (net output)
+    P_need_KWh = np.array([x['P_need_KWh'] for x in history])         # kW
+    P_raw_KWh = np.array([x['P_raw_KWh'] for x in history])           # kW (raw PEMFC)
+
+    H2_rate_mol_s = np.array([x['H2_rate_mol_s'] for x in history])
+
+    Q_gen_KWh = np.array([x['Q_gen_KWh'] for x in history])          # kW
+    Q_heater_KWh = np.array([x['Q_heater_KWh'] for x in history])    # kW
+    Q_need_KWh = np.array([x['Q_need_KWh'] for x in history])        # kW
+    Q_loss_KWh = np.array([x['Q_loss_KWh'] for x in history])        # kW
+    Q_gen_used_KWh = np.array([x['Q_gen_used_KWh'] for x in history])   # kW
+
     SOC = np.array([x['SOC'] for x in history])
     SOH = np.array([x['SOH'] for x in history])
     T_tank_C = np.array([x['T_tank_C'] for x in history])
-    
+
     reward_list = np.array([x['reward'] for x in history])
-    
-    t = np.arange(len(P_gen_final))
-    
+
+    t = np.arange(len(P_gen_final_KWh))
+
     # ===============================
     # 2. 电功率指标
     # ===============================
     # 电跟踪率（截断，防止>1和除0）
-    eta_e_t = P_gen_final / (P_load)
+    eta_e_t = P_gen_final_KWh / (P_need_KWh)
     eta_e_avg = np.mean(eta_e_t)
 
     # ===============================
     # 3. 热功率指标
     # ===============================
     # 实际供热（实际被用掉的 PEMFC 产热 + 电加热）
-    Q_supply = Q_gen_used + Q_heater
+    Q_supply = Q_gen_used_KWh + Q_heater_KWh
 
-    eta_h_t = Q_supply / (Q_load)
+    eta_h_t = Q_supply / (Q_need_KWh)
     eta_h_avg = np.mean(eta_h_t)
     # ===============================
     # 4. SOC 指标
@@ -113,13 +114,14 @@ def plot_analysis():
     # η = (有效供电 + 有效供热) / (总发电 + 总供热)
     # 长时间尺度我觉得可以忽略热水箱和SOC温度变化
     # ===============================
-    E_e_useful = np.sum(np.minimum(P_gen_final, P_load))
-    E_h_useful = np.sum(np.minimum(Q_supply, Q_load))
+    E_e_useful = np.sum(np.minimum(P_gen_final_KWh, P_need_KWh))
+    E_h_useful = np.sum(np.minimum(Q_supply, Q_need_KWh))
 
-    E_e_gen = np.sum(P_gen_final)
-    E_h_gen = np.sum(Q_supply)
-
-    eta_overall = (E_e_useful + E_h_useful) / (E_e_gen + E_h_gen )
+    # 使用训练环境中定义的 HHV_H2（J/mol）。若需要，可换为 LHV。
+    HHV_H2 = 285850.0  # J/mol (训练文件中 p['HHV_H2'] = 285850.0)
+    E_h = H2_rate_mol_s * HHV_H2 / 1000.0 * 300/3600.  # kWh
+    
+    eta_overall = (E_e_useful + E_h_useful) / np.sum(E_h)
     # ===============================
     # 8. 打印关键统计指标（论文用）
     # ===============================
@@ -135,8 +137,8 @@ def plot_analysis():
     # =====================================================
     # ---------- 电功率 ----------
     plt.figure(figsize=(10, 4))
-    plt.plot(t, P_load, label="Electric Load", linestyle="--")
-    plt.plot(t, P_gen_final, label="PEMFC Net Power")
+    plt.plot(t, P_need_KWh, label="Electric Load", linestyle="--")
+    plt.plot(t, P_gen_final_KWh, label="PEMFC Net Power")
     plt.xlabel("Time step")
     plt.ylabel("Power (kW)")
     plt.title("Electrical Power")
@@ -145,8 +147,8 @@ def plot_analysis():
     plt.savefig("电功率曲线.png", dpi=300)
     # ---------- 热功率 ----------
     plt.figure(figsize=(10, 4))
-    plt.plot(t, Q_load+ Q_loss, label="need Load", linestyle="--")
-    plt.plot(t, Q_heater+Q_gen, label="Heater Power")
+    plt.plot(t, Q_need_KWh + Q_loss_KWh, label="need Load", linestyle="--")
+    plt.plot(t, Q_heater_KWh + Q_gen_KWh, label="Heater Power")
     plt.xlabel("Time step")
     plt.ylabel("Power (kW)")
     plt.title("Thermal Power")
@@ -210,7 +212,7 @@ def plot_analysis():
 
     # ---------- loss ----------
     plt.figure(figsize=(10, 4))
-    plt.plot(t, Q_loss)
+    plt.plot(t, Q_loss_KW)
     plt.xlabel("Time step")
     plt.ylabel("Heat Loss (kW)")
     plt.title("Heat Loss per Step")
@@ -223,7 +225,7 @@ def plot_analysis():
     
 
 if __name__ == "__main__":
-    results = run_test()
+    # results = run_test()
     #保存结果
-    #np.save("test_results.npy", results)
+    # np.save("test_results.npy", results)
     plot_analysis()
