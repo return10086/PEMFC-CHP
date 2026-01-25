@@ -2,7 +2,7 @@
 Author: Jiale Cheng &&cjl2646289864@gmail.com
 Date: 2025-12-11 22:09:38
 LastEditors: Jiale Cheng &&cjl2646289864@gmail.com
-LastEditTime: 2026-01-23 17:14:38
+LastEditTime: 2026-01-24 20:59:42
 FilePath: \PC\env\pemfc_chp_train.py
 Description: 单纯作为 PEMFC-CHP 强化学习环境的定义与训练脚本
 Copyright (c) 2026 by cjl2646289864@gmail.com, All Rights Reserved. 
@@ -42,7 +42,7 @@ class PEMFCCHPEnv(gym.Env):
             'F': 96487,
             'R': 8.314,
             'atm_to_pa': 101325,
-            'HHV_H2': 285850.0,
+            'LHV_H2': 241820.0,
 
             # -------- 热系统 --------
             'M_water': 100.0,
@@ -244,7 +244,7 @@ class PEMFCCHPEnv(gym.Env):
     '''    
     def _run_pemfc(self, j_vec):
         sim = self._run_system_physics(j_vec)
-        return sim['P_net'], sim['Q_cool'], sim['mol_H2_rate']
+        return sim['P_net'], sim['Q_cool'], sim['mol_H2_rate'], sim.get('E_h_W', 0.0)
 
     '''
     description: 更新SOC唯一入口
@@ -478,7 +478,7 @@ class PEMFCCHPEnv(gym.Env):
         # 2. 负载与 PEMFC 计算
         # ============================================================
         P_need, Q_need = self._get_load()
-        P_gen_raw, Q_gen, mol_H2 = self._run_pemfc(j_vec)
+        P_gen_raw, Q_gen, mol_H2, E_h_W = self._run_pemfc(j_vec)
 
         # ============================================================
         # 3. 热管理（只做功率/热量分配，不更新状态）
@@ -600,6 +600,9 @@ class PEMFCCHPEnv(gym.Env):
             'P_raw_KWh': (P_gen_raw / 1000.0) * (p['dt'] / 3600.0),
             
             'H2_rate_mol_s': mol_H2,
+            'H2_energy_W': E_h_W,
+            'H2_energy_KW': E_h_W / 1000.0,
+            'H2_energy_KWh': (E_h_W / 1000.0) * (p['dt'] / 3600.0),
 
             'Q_gen_W': Q_gen,
             'Q_gen_KW': Q_gen / 1000.0,
@@ -638,6 +641,11 @@ class PEMFCCHPEnv(gym.Env):
         # 考虑衰减：电压基准随累积电压降减小
         V_base = p['V_nom'] - (self.state_fc_V_loss / p['N_cell'])#
 
+        # 与选用热值一致的“热中性电压”(thermoneutral voltage)
+        # E_tn = ΔH / (2F). 当使用 LHV 时约为 1.25V；使用 HHV 时约为 1.48V。
+        h2_heat = p.get('LHV_H2', p.get('HHV_H2', 0.0))  # J/mol
+        E_tn = h2_heat / (2.0 * p['F']) if h2_heat > 0 else 0.0
+
         for i, j in enumerate(j_vec):
             if j <= 1e-4: continue
             I = j * p['A_fc']
@@ -645,14 +653,24 @@ class PEMFCCHPEnv(gym.Env):
             V_cell = max(0.45, V_base - j * p['R_internal']) #
 
             P_stack = p['N_cell'] * V_cell * I
-            Q_stack = p['N_cell'] * I * (1.48 - V_cell)
+            # 产热：Q = N_cell * I * (E_tn - V_cell)
+            # 用 E_tn 替代常数 1.48，避免在 LHV/HHV 切换时能量守恒被破坏，从而导致“总效率>1”。
+            Q_stack = p['N_cell'] * I * max(E_tn - V_cell, 0.0)
             mol_H2 = p['N_cell'] * I / (2 * p['F'])
 
             P_tot += P_stack
             Q_tot += Q_stack
             H2_tot += mol_H2
 
-        return {'P_net': P_tot, 'Q_cool': Q_tot, 'mol_H2_rate': H2_tot}
+        # 将氢气摩尔流率转换为功率（W）
+        E_h_W = H2_tot * h2_heat
+
+        return {
+            'P_net': P_tot,
+            'Q_cool': Q_tot,
+            'mol_H2_rate': H2_tot,
+            'E_h_W': E_h_W,
+        }
 
 from stable_baselines3.common.callbacks import ( BaseCallback, EvalCallback, CheckpointCallback, CallbackList ) 
 from datetime import datetime 

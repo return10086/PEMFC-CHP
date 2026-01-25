@@ -2,7 +2,7 @@
 Author: Jiale Cheng &&cjl2646289864@gmail.com
 Date: 2025-12-11 22:09:38
 LastEditors: Jiale Cheng &&cjl2646289864@gmail.com
-LastEditTime: 2026-01-23 18:12:53
+LastEditTime: 2026-01-25 16:54:18
 FilePath: \PC\env\pemfc_chp_test.py
 Description: 单纯作为测试脚本使用，加载训练好的模型进行推理，并绘图分析结果
 Copyright (c) 2026 by cjl2646289864@gmail.com, All Rights Reserved. 
@@ -71,6 +71,12 @@ def plot_analysis():
     SOH = np.array([x['SOH'] for x in history])
     T_tank_C = np.array([x['T_tank_C'] for x in history])
 
+    # 使用环境返回的 H2 能量（kWh/step），以保证与训练物理模型一致；若无该字段则回退到旧计算
+    E_h = np.array([
+        x.get('H2_energy_KWh', x['H2_rate_mol_s'] * 241820.0 / 1000.0 * (300.0/3600.0))
+        for x in history
+    ])
+    
     reward_list = np.array([x['reward'] for x in history])
 
     t = np.arange(len(P_gen_final_KWh))
@@ -117,11 +123,15 @@ def plot_analysis():
     E_e_useful = np.sum(np.minimum(P_gen_final_KWh, P_need_KWh))
     E_h_useful = np.sum(np.minimum(Q_supply, Q_need_KWh))
 
-    # 使用训练环境中定义的 HHV_H2（J/mol）。若需要，可换为 LHV。
-    HHV_H2 = 285850.0  # J/mol (训练文件中 p['HHV_H2'] = 285850.0)
-    E_h = H2_rate_mol_s * HHV_H2 / 1000.0 * 300/3600.  # kWh
+    # 使用训练环境中定义的 HHV_H2（J/mol）。若需要，可换为 LHV。kWh
     
-    eta_overall = (E_e_useful + E_h_useful) / np.sum(E_h)
+    # ===== 整体效率分母修正：考虑电池净放电（否则可能出现效率偏大甚至>1） =====
+    # 电池能量容量 (kWh)
+    batt_capacity_kWh = (100.0 * 48.0) / 1000.0
+    delta_batt_kWh = (SOC[0] - SOC[-1]) * batt_capacity_kWh
+    E_in_total = np.sum(E_h) + max(delta_batt_kWh, 0.0)
+
+    eta_overall = (E_e_useful + E_h_useful) / (E_in_total + 1e-12)
     # ===============================
     # 8. 打印关键统计指标（论文用）
     # ===============================
@@ -129,6 +139,9 @@ def plot_analysis():
     print(f"Average Electric Tracking Rate η_e: {eta_e_avg:.3f}")
     print(f"Average Thermal  Tracking Rate η_h: {eta_h_avg:.3f}")
     print(f"Overall Energy Efficiency η: {eta_overall:.3f}")
+    print(f"Battery ΔE (kWh, discharge +): {delta_batt_kWh:.4f}")
+    # 能量守恒自检：理论上 P_raw + Q_gen ≈ H2_energy（当物理模型自洽时应接近1）
+    print(f"Energy balance check (P_raw+Q_gen)/H2: {(np.sum(P_raw_KWh) + np.sum(Q_gen_KWh)) / (np.sum(E_h) + 1e-12):.3f}")
     print(f"SOC: mean={SOC_mean:.3f}, min={SOC_min:.3f}, max={SOC_max:.3f}")
     print(f"SOH decay: {SOH_decay:.5f}, decay rate per step: {SOH_decay_rate:.5e}")
     print(f"T_tank: mean={T_mean:.2f} °C, min={T_min:.2f}, max={T_max:.2f}")
@@ -225,7 +238,7 @@ def plot_analysis():
     
 
 if __name__ == "__main__":
-    # results = run_test()
+    #results = run_test()
     #保存结果
-    # np.save("test_results.npy", results)
+    #np.save("test_results.npy", results)
     plot_analysis()
